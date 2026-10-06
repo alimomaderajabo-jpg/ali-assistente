@@ -1,274 +1,132 @@
-require("dotenv").config();
+// Ali Assistente - servidor simples, sem dependências.
+// Esconde a chave do Gemini e limita o uso por pessoa.
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
-const express = require("express");
-const path = require("path");
-const fs = require("fs");
-const jwt = require("jsonwebtoken");
-const bcrypt = require("bcryptjs");
-const Database = require("better-sqlite3");
-const PDFDocument = require("pdfkit");
+const PORT = process.env.PORT || 3000;
+const KEY = process.env.GEMINI_API_KEY || '';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+const BASE = process.env.GEMINI_BASE || 'https://generativelanguage.googleapis.com';
+const PER_HOUR = parseInt(process.env.LIMIT_PER_HOUR || '40', 10);
+const PER_DAY = parseInt(process.env.LIMIT_PER_DAY || '1000', 10);
 
-const app = express();
-const PORT = Number(process.env.PORT || 3000);
-const JWT_SECRET = process.env.JWT_SECRET || "change-me";
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+// Só estes ficheiros são públicos (o server.js nunca é enviado).
+const FILES = {
+  '/': ['index.html', 'text/html; charset=utf-8'],
+  '/index.html': ['index.html', 'text/html; charset=utf-8'],
+  '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'],
+  '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
+  '/icon-192.png': ['icon-192.png', 'image/png'],
+  '/icon-512.png': ['icon-512.png', 'image/png']
+};
 
-const dataDir = path.join(__dirname, "data");
-fs.mkdirSync(dataDir, { recursive: true });
-
-const db = new Database(path.join(dataDir, "ali-assistente.sqlite"));
-db.pragma("journal_mode = WAL");
-
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT NOT NULL UNIQUE,
-  password_hash TEXT NOT NULL,
-  name TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS chats (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  title TEXT NOT NULL DEFAULT 'Nova conversa',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chat_id INTEGER NOT NULL,
-  role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-  content TEXT NOT NULL,
-  image_data TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS memories (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  content TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-`);
-
-app.use(express.json({ limit: "15mb" }));
-app.use(express.static(path.join(__dirname, "public")));
-
-function sign(user) {
-  return jwt.sign({ id: user.id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: "30d" });
+const hits = new Map();
+let day = new Date().toISOString().slice(0, 10), dayCount = 0;
+function allowed(ip) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== day) { day = today; dayCount = 0; }
+  if (dayCount >= PER_DAY) return 'O Ali atingiu o limite de hoje. Tenta amanhã.';
+  const now = Date.now();
+  const arr = (hits.get(ip) || []).filter(t => now - t < 3600000);
+  if (arr.length >= PER_HOUR) return 'Fizeste muitas mensagens numa hora. Espera um pouco e tenta outra vez.';
+  arr.push(now); hits.set(ip, arr); dayCount++;
+  return '';
 }
+setInterval(() => { const now = Date.now(); for (const [k, v] of hits) if (!v.some(t => now - t < 3600000)) hits.delete(k); }, 600000).unref();
 
-function auth(req, res, next) {
-  const h = req.headers.authorization || "";
-  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
-  if (!token) return res.status(401).json({ error: "AUTH_REQUIRED" });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: "INVALID_SESSION" });
-  }
+function json(res, status, obj) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(obj));
 }
-
-function cleanText(v, max = 20000) {
-  return String(v ?? "").trim().slice(0, max);
-}
-
-app.post("/api/auth/register", async (req, res) => {
-  const name = cleanText(req.body.name, 80);
-  const email = cleanText(req.body.email, 180).toLowerCase();
-  const password = String(req.body.password || "");
-
-  if (!name || !email || password.length < 6)
-    return res.status(400).json({ error: "Dados inválidos. Use nome, e-mail e senha com pelo menos 6 caracteres." });
-
-  const exists = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
-  if (exists) return res.status(409).json({ error: "Este e-mail já está registado." });
-
-  const hash = await bcrypt.hash(password, 12);
-  const result = db.prepare("INSERT INTO users (email,password_hash,name) VALUES (?,?,?)").run(email, hash, name);
-  const user = { id: result.lastInsertRowid, email, name };
-
-  res.json({ token: sign(user), user });
-});
-
-app.post("/api/auth/login", async (req, res) => {
-  const email = cleanText(req.body.email, 180).toLowerCase();
-  const password = String(req.body.password || "");
-  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
-
-  if (!user || !(await bcrypt.compare(password, user.password_hash)))
-    return res.status(401).json({ error: "E-mail ou senha incorretos." });
-
-  res.json({
-    token: sign(user),
-    user: { id: user.id, email: user.email, name: user.name }
+function readBody(req, max) {
+  return new Promise((ok, fail) => {
+    let size = 0; const parts = [];
+    req.on('data', c => { size += c.length; if (size > max) { fail(new Error('grande')); req.destroy(); } else parts.push(c); });
+    req.on('end', () => ok(Buffer.concat(parts).toString('utf8')));
+    req.on('error', fail);
   });
-});
-
-app.get("/api/me", auth, (req, res) => {
-  const user = db.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").get(req.user.id);
-  if (!user) return res.status(404).json({ error: "USER_NOT_FOUND" });
-  res.json({ user });
-});
-
-app.get("/api/chats", auth, (req, res) => {
-  const chats = db.prepare(`
-    SELECT id,title,created_at,updated_at
-    FROM chats WHERE user_id=? ORDER BY updated_at DESC
-  `).all(req.user.id);
-  res.json({ chats });
-});
-
-app.post("/api/chats", auth, (req, res) => {
-  const title = cleanText(req.body.title, 120) || "Nova conversa";
-  const result = db.prepare("INSERT INTO chats (user_id,title) VALUES (?,?)").run(req.user.id, title);
-  res.json({ id: result.lastInsertRowid, title });
-});
-
-app.get("/api/chats/:id", auth, (req, res) => {
-  const chat = db.prepare("SELECT * FROM chats WHERE id=? AND user_id=?").get(req.params.id, req.user.id);
-  if (!chat) return res.status(404).json({ error: "CHAT_NOT_FOUND" });
-
-  const messages = db.prepare(`
-    SELECT id,role,content,image_data,created_at
-    FROM messages WHERE chat_id=? ORDER BY id ASC
-  `).all(chat.id);
-
-  res.json({ chat, messages });
-});
-
-app.delete("/api/chats/:id", auth, (req, res) => {
-  const result = db.prepare("DELETE FROM chats WHERE id=? AND user_id=?").run(req.params.id, req.user.id);
-  if (!result.changes) return res.status(404).json({ error: "CHAT_NOT_FOUND" });
-  res.json({ ok: true });
-});
-
-app.get("/api/memories", auth, (req, res) => {
-  res.json({ memories: db.prepare("SELECT id,content,created_at FROM memories WHERE user_id=? ORDER BY id DESC").all(req.user.id) });
-});
-
-app.post("/api/memories", auth, (req, res) => {
-  const content = cleanText(req.body.content, 1000);
-  if (!content) return res.status(400).json({ error: "MEMORY_EMPTY" });
-  const result = db.prepare("INSERT INTO memories (user_id,content) VALUES (?,?)").run(req.user.id, content);
-  res.json({ id: result.lastInsertRowid, content });
-});
-
-app.delete("/api/memories/:id", auth, (req, res) => {
-  db.prepare("DELETE FROM memories WHERE id=? AND user_id=?").run(req.params.id, req.user.id);
-  res.json({ ok: true });
-});
-
-function buildSystem(memories) {
-  return `Você é o Ali Assistente, um assistente de inteligência artificial multiplataforma.
-Responda na língua do usuário. Em português, use português claro de Portugal/África.
-Se o usuário perguntar quem criou você, responda que o criador oficial é Ali Momade Rajabo.
-Não invente capacidades que não estejam disponíveis.
-Memórias autorizadas do usuário:
-${memories.map(m => "- " + m.content).join("\n") || "(nenhuma)"}`;
 }
-
-app.post("/api/chat", auth, async (req, res) => {
-  const chatId = Number(req.body.chatId);
-  const content = cleanText(req.body.content, 12000);
-  const image = req.body.image ? String(req.body.image) : null;
-
-  const chat = db.prepare("SELECT * FROM chats WHERE id=? AND user_id=?").get(chatId, req.user.id);
-  if (!chat) return res.status(404).json({ error: "CHAT_NOT_FOUND" });
-  if (!content && !image) return res.status(400).json({ error: "EMPTY_MESSAGE" });
-  if (!ANTHROPIC_API_KEY) return res.status(503).json({ error: "AI_NOT_CONFIGURED", message: "Configure ANTHROPIC_API_KEY no servidor." });
-
-  const history = db.prepare(`
-    SELECT role,content,image_data FROM messages
-    WHERE chat_id=? ORDER BY id DESC LIMIT 20
-  `).all(chatId).reverse();
-
-  const memories = db.prepare("SELECT content FROM memories WHERE user_id=? ORDER BY id DESC LIMIT 30").all(req.user.id);
-
-  const messages = history.map(m => {
-    if (m.image_data) {
-      return {
-        role: m.role,
-        content: [
-          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: m.image_data.split(",").pop() } },
-          ...(m.content ? [{ type: "text", text: m.content }] : [])
-        ]
-      };
+// Aceita só o que a página precisa; o resto é ignorado.
+function clean(b) {
+  if (!b || !Array.isArray(b.contents) || !b.contents.length || b.contents.length > 40) return null;
+  let images = 0;
+  const contents = [];
+  for (const c of b.contents) {
+    if (!c || !['user', 'model'].includes(c.role) || !Array.isArray(c.parts)) return null;
+    const parts = [];
+    for (const p of c.parts) {
+      if (p && typeof p.text === 'string') parts.push({ text: p.text.slice(0, 30000) });
+      else if (p && p.inlineData && /^image\/(jpeg|png|webp)$/.test(p.inlineData.mimeType) && typeof p.inlineData.data === 'string') {
+        if (++images > 8) return null;
+        parts.push({ inlineData: { mimeType: p.inlineData.mimeType, data: p.inlineData.data } });
+      }
     }
-    return { role: m.role, content: m.content };
-  });
-
-  if (content || image) {
-    const current = image ? {
-      role: "user",
-      content: [
-        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: image.split(",").pop() } },
-        ...(content ? [{ type: "text", text: content }] : [])
-      ]
-    } : { role: "user", content };
-    messages.push(current);
+    if (!parts.length) return null;
+    contents.push({ role: c.role, parts });
   }
+  const out = { contents };
+  const si = b.systemInstruction && b.systemInstruction.parts && b.systemInstruction.parts[0];
+  if (si && typeof si.text === 'string') out.systemInstruction = { parts: [{ text: si.text.slice(0, 12000) }] };
+  const g = b.generationConfig || {};
+  out.generationConfig = { maxOutputTokens: Math.min(Math.max(parseInt(g.maxOutputTokens, 10) || 2048, 1), 8192) };
+  if (typeof g.temperature === 'number') out.generationConfig.temperature = Math.min(Math.max(g.temperature, 0), 1);
+  if (g.thinkingConfig && typeof g.thinkingConfig === 'object') {
+    const t = {};
+    if (Number.isInteger(g.thinkingConfig.thinkingBudget)) t.thinkingBudget = g.thinkingConfig.thinkingBudget;
+    if (['minimal', 'low', 'medium', 'high'].includes(g.thinkingConfig.thinkingLevel)) t.thinkingLevel = g.thinkingConfig.thinkingLevel;
+    if (Object.keys(t).length) out.generationConfig.thinkingConfig = t;
+  }
+  if (Array.isArray(b.tools) && b.tools.length === 1 && b.tools[0] && b.tools[0].google_search) out.tools = [{ google_search: {} }];
+  return out;
+}
 
+async function chat(req, res) {
+  if (!KEY) return json(res, 503, { error: { message: 'O servidor ainda não tem a chave configurada.' } });
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const why = allowed(ip);
+  if (why) return json(res, 429, { error: { message: why } });
+  let body;
+  try { body = clean(JSON.parse(await readBody(req, 12 * 1024 * 1024))); } catch (e) { body = null; }
+  if (!body) return json(res, 400, { error: { message: 'Pedido inválido.' } });
+  const ctl = new AbortController();
+  res.on('close', () => ctl.abort());
+  const timer = setTimeout(() => ctl.abort(), 120000);
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01"
-      },
-      body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
-        max_tokens: 1500,
-        system: buildSystem(memories),
-        messages
-      })
+    const up = await fetch(BASE + '/v1beta/models/' + encodeURIComponent(MODEL) + ':streamGenerateContent?alt=sse', {
+      method: 'POST', signal: ctl.signal,
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': KEY },
+      body: JSON.stringify(body)
     });
-
-    const data = await r.json();
-    if (!r.ok) {
-      const code = r.status === 429 ? "RATE_LIMIT" : (r.status === 401 || r.status === 403 ? "AUTH_ERROR" : "AI_ERROR");
-      return res.status(r.status).json({ error: code, detail: data?.error?.message || "Erro da IA." });
+    if (!up.ok) {
+      const txt = await up.text();
+      res.writeHead(up.status, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(txt);
     }
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
+    for await (const chunk of up.body) res.write(chunk);
+    res.end();
+  } catch (e) {
+    if (!res.headersSent) json(res, 502, { error: { message: 'Não consegui falar com o Gemini. Tenta outra vez.' } });
+    else res.end();
+  } finally { clearTimeout(timer); }
+}
 
-    const answer = (data.content || []).filter(x => x.type === "text").map(x => x.text).join("\n").trim();
-    db.prepare("INSERT INTO messages (chat_id,role,content,image_data) VALUES (?,?,?,?)").run(chatId, "user", content, image);
-    db.prepare("INSERT INTO messages (chat_id,role,content) VALUES (?,?,?)").run(chatId, "assistant", answer);
-    db.prepare("UPDATE chats SET updated_at=CURRENT_TIMESTAMP WHERE id=?").run(chatId);
-
-    res.json({ text: answer });
-  } catch (err) {
-    res.status(500).json({ error: "SERVER_ERROR", detail: err.message });
+const server = http.createServer((req, res) => {
+  const url = (req.url || '/').split('?')[0];
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (url === '/api/health' && req.method === 'GET') return json(res, 200, { ok: true, hasKey: !!KEY });
+  if (url === '/api/chat' && req.method === 'POST') return chat(req, res);
+  const f = FILES[url];
+  if (req.method === 'GET' && f) {
+    fs.readFile(path.join(__dirname, f[0]), (err, data) => {
+      if (err) { res.writeHead(404); return res.end('Não encontrado'); }
+      res.writeHead(200, { 'Content-Type': f[1], 'Cache-Control': f[1].startsWith('image') ? 'public, max-age=86400' : 'no-cache' });
+      res.end(data);
+    });
+    return;
   }
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Não encontrado');
 });
-
-app.post("/api/pdf", auth, (req, res) => {
-  const title = cleanText(req.body.title, 200) || "Documento";
-  const content = cleanText(req.body.content, 50000);
-  if (!content) return res.status(400).json({ error: "PDF_EMPTY" });
-
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="ali-assistente.pdf"`);
-
-  const doc = new PDFDocument({ size: "A4", margin: 50 });
-  doc.pipe(res);
-  doc.fontSize(20).text(title, { align: "center" });
-  doc.moveDown();
-  doc.fontSize(11).text(content, { align: "left", lineGap: 5 });
-  doc.end();
-});
-
-app.get("*", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-
-app.listen(PORT, () => {
-  console.log(`Ali Assistente V1 em http://localhost:${PORT}`);
-});
+server.listen(PORT, '0.0.0.0', () => console.log('Ali Assistente a correr na porta ' + PORT));
