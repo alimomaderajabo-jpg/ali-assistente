@@ -4,10 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Ali Assistente</title>
-<meta name="theme-color" content="#0F5A3C">
-<link rel="manifest" href="/manifest.webmanifest">
-<link rel="icon" href="/icon-192.png">
-<link rel="apple-touch-icon" href="/icon-192.png">
 <style>
 :root{
   --bg:#F2F5F3; --panel:#FFFFFF; --ink:#16231D; --muted:#5E6F66; --line:#DCE4DF;
@@ -154,6 +150,17 @@ header{display:flex;align-items:center;gap:10px;padding:10px 12px;padding-top:ma
 </style>
 </head>
 <body>
+<div id="auth" style="position:fixed;inset:0;background:var(--bg);z-index:100;display:none;align-items:center;justify-content:center;padding:20px">
+<div style="background:#fff;border:1px solid var(--line);border-radius:18px;padding:22px;width:100%;max-width:380px">
+<h2 style="font-family:Georgia,serif;font-size:24px;margin-bottom:4px">Ali Assistente</h2>
+<p id="authSub" style="color:var(--muted);font-size:14px;margin-bottom:14px">Entra na tua conta</p>
+<input type="text" id="aUser" placeholder="Nome de utilizador" autocapitalize="off" autocomplete="username" maxlength="20" style="width:100%;margin-bottom:8px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;font:inherit">
+<input type="email" id="aEmail" placeholder="Email" autocomplete="email" autocapitalize="off" style="display:none;width:100%;margin-bottom:8px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;font:inherit">
+<input type="password" id="aPass" placeholder="Palavra-passe (mín. 6 caracteres)" autocomplete="current-password" style="width:100%;margin-bottom:8px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;font:inherit">
+<p id="aErr" style="color:var(--err);font-size:14px;min-height:20px;margin-bottom:6px"></p>
+<button class="btn" id="aGo">Entrar</button>
+<button class="btn ghost" id="aSwitch">Não tenho conta: criar conta</button>
+</div></div>
 <div id="app">
   <header>
     <button class="iconbtn" id="menu" aria-label="Abrir conversas"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
@@ -196,8 +203,8 @@ const LANGS = [
   ['pt-PT','Português'],['en-US','English'],['fr-FR','Français'],
   ['es-ES','Español'],['ar-SA','العربية'],['sw-KE','Kiswahili']
 ];
-let S = { chats: [], current: null, settings: { lang:'pt-PT', voice:'', speak:false, memOn:true, mem:[], key:'', gkey:'', model:'gemini-3.5-flash', school:true, web:false } };
-const APP_VERSION = '3.0 (app)';
+let S = { chats: [], current: null, settings: { lang:'pt-PT', voice:'', speak:false, memOn:true, mem:[], model:'gemini-3.5-flash', school:true, web:false } };
+const APP_VERSION = '2.3 (servidor)';
 const SCHEMA = 4;
 /* Migrações: cada passo leva os dados da versão N para N+1. Para mudar a estrutura no futuro, acrescenta um passo novo aqui e sobe SCHEMA. */
 const MIGRATIONS = {
@@ -223,44 +230,42 @@ function migrate(d){
 }
 let pendingImgs = [], busy = false, rec = null, recOn = false;
 
-const hasClaudeStore = () => typeof window.storage !== 'undefined' && window.storage && window.storage.get;
-async function getStore(k){
-  if(hasClaudeStore()) return await window.storage.get(k);
-  const v = localStorage.getItem(k); return v ? { value:v } : null;
+/* ---------- dados: guardados no servidor, na conta de cada utilizador ---------- */
+let saveT = null, lastSaved = '';
+async function api(method, path, body){
+  const opt = { method, credentials:'same-origin', headers:{} };
+  if(body !== undefined){ opt.headers['Content-Type'] = 'application/json'; opt.body = typeof body === 'string' ? body : JSON.stringify(body); }
+  let r;
+  try{ r = await fetch(path, opt); }
+  catch(e){ const x = new Error('Sem ligação ao servidor. Verifica a internet e tenta outra vez.'); x.status = 0; throw x; }
+  let j = null; try{ j = await r.json(); }catch(_){}
+  if(r.status === 401 && path !== '/api/auth/login' && path !== '/api/auth/register') sessionExpired();
+  if(!r.ok){ const e = new Error((j && j.error && j.error.message) || ('Erro ' + r.status)); e.status = r.status; throw e; }
+  return j;
 }
-async function setStore(k,v){
-  if(hasClaudeStore()) return await window.storage.set(k,v);
-  localStorage.setItem(k,v);
-}
+function sessionExpired(){ if(CURUSER){ CURUSER = null; toast('A sessão expirou. Entra outra vez.', 6000); } showAuth(); }
+/* devolve true se o servidor já tinha dados desta conta */
 async function load(){
-  try{
-    const r = await getStore('ali-state');
-    if(r && r.value){
-      const d = migrate(JSON.parse(r.value));
-      S.chats = d.chats || [];
-      S.current = d.current || null;
-      S.settings = Object.assign(S.settings, d.settings || {});
-    }
-  }catch(e){}
+  const j = await api('GET', '/api/state');
+  if(j.state){
+    const d = migrate(j.state);
+    S.chats = d.chats || []; S.current = d.current || null;
+    S.settings = Object.assign(S.settings, d.settings || {});
+    delete S.settings.gkey; delete S.settings.key;
+  }
+  return !!j.state;
 }
-function trimOldestImage(){
-  const chats = S.chats.slice().sort((a,b)=>a.updated-b.updated);
-  for(const c of chats) for(const m of c.messages){ if(m.imgs && m.imgs.length){ delete m.imgs; m.img = true; return true; } }
-  return false;
-}
-let storageWarned = false;
-async function save(){
-  S.v = SCHEMA; let trimmed = false;
-  for(let n=0;n<300;n++){
-    try{ await setStore('ali-state', JSON.stringify(S)); if(trimmed) toast('Espaço cheio: apaguei as imagens das conversas mais antigas para guardar as novas.'); return; }
-    catch(e){
-      const quota = !!e && (e.name === 'QuotaExceededError' || e.code === 22 || /quota|exceed|too large/i.test(String(e.message)));
-      if(quota && trimOldestImage()){ trimmed = true; continue; }
-      if(!storageWarned){ storageWarned = true; toast(quota ? 'A memória do telemóvel está cheia. Apaga conversas antigas.' : 'Este visor não deixa guardar as conversas nem a chave. Abre o ficheiro no Chrome para ficar tudo guardado.', 10000); }
-      return;
-    }
+async function pushState(){
+  if(!CURUSER) return;
+  const body = JSON.stringify({ state: S });
+  if(body === lastSaved) return;
+  try{ await api('PUT', '/api/state', body); lastSaved = body; }
+  catch(e){
+    if(e.status === 413) toast('Há demasiadas imagens guardadas. Apaga algumas conversas antigas.', 9000);
+    else if(e.status !== 401){ toast('Não consegui guardar agora. Vou tentar outra vez.', 6000); saveT = setTimeout(pushState, 5000); }
   }
 }
+function save(){ S.v = SCHEMA; clearTimeout(saveT); saveT = setTimeout(pushState, 600); }
 
 const cur = () => S.chats.find(c => c.id === S.current) || null;
 const langName = () => (LANGS.find(l => l[0] === S.settings.lang) || LANGS[0])[1];
@@ -434,8 +439,7 @@ async function callModel(c, upto, fulls, onText){
   const contents = buildContents(msgs, fulls);
   const model = (S.settings.model || 'gemini-3.5-flash').trim();
   const ctl = new AbortController(); const tmo = setTimeout(() => ctl.abort(), 60000);
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':streamGenerateContent?alt=sse';
-  await serverReady;
+  const url = '/api/gemini/stream';
   const doReq = (withThink, web) => {
     const gc = { maxOutputTokens: 8192 };
     if(withThink){
@@ -445,7 +449,7 @@ async function callModel(c, upto, fulls, onText){
     }
     const body = { systemInstruction:{ parts:[{ text: sysPrompt(useWeb) }] }, contents, generationConfig: gc };
     if(web) body.tools = [{ google_search:{} }];
-    return fetch(serverMode ? '/api/chat' : url, { method:'POST', signal: ctl.signal, headers: serverMode ? { 'Content-Type':'application/json' } : { 'Content-Type':'application/json', 'x-goog-api-key': S.settings.gkey }, body: JSON.stringify(body) });
+    return fetch(url, { method:'POST', credentials:'same-origin', signal: ctl.signal, headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ model, request: body }) });
   };
   let web = useWeb, fellBack = false;
   let res = await doReq(true, web);
@@ -488,7 +492,8 @@ async function callModel(c, upto, fulls, onText){
 function errorToast(e){
   const why = String(e && e.message || e).slice(0,160);
   const web = e && e.web ? ' Se o erro for da pesquisa, desliga o botão 🌐 e tenta outra vez.' : '';
-  if(e.status===400 || e.status===401 || e.status===403) toast('Chave inválida ou sem permissão. Confirma-a nas Definições. ('+why+')'+web);
+  if(e.status===401){ sessionExpired(); return; }
+  if(e.status===400 || e.status===403) toast('O serviço de IA recusou o pedido. Tenta outra vez. ('+why+')'+web);
   else if(e.status===429) toast('Limite grátis atingido. Espera um pouco e tenta outra vez. ('+why+')');
   else if(e.status) toast('Erro do servidor: '+why+web);
   else if(e && e.name==='AbortError') toast('Demorou mais de 60 segundos sem resposta. Verifica a internet e tenta outra vez.');
@@ -500,8 +505,6 @@ async function send(){
   if(busy) return;
   const text = $('#inp').value.trim();
   if(!text && !pendingImgs.length) return;
-  await serverReady;
-  if(!serverMode && !S.settings.gkey){ toast('Primeiro cola a tua chave do Gemini nas Definições.'); settings(); return; }
   stopSpeak();
   let c = cur();
   const fresh = !c;
@@ -552,8 +555,6 @@ async function regenerate(){
   const c = cur(); if(!c) return;
   const idx = c.messages.length - 1; const m = c.messages[idx];
   if(!m || m.role !== 'assistant') return;
-  await serverReady;
-  if(!serverMode && !S.settings.gkey){ toast('Primeiro cola a tua chave do Gemini nas Definições.'); settings(); return; }
   stopSpeak();
   if(!m.vers) m.vers = [{ text:m.text, searched:m.searched, sources:m.sources }];
   const prevVi = m.vi != null ? m.vi : m.vers.length - 1;
@@ -637,13 +638,6 @@ function toggleMic(){
 }
 function voicesFor(){ return ('speechSynthesis' in window) ? speechSynthesis.getVoices().filter(v=>v.lang.toLowerCase().startsWith(S.settings.lang.slice(0,2).toLowerCase())) : []; }
 let speakId = 0;
-/* ---------- modo servidor (app online) ---------- */
-let serverMode = false, deferredInstall = null;
-const serverReady = (/^https?:$/.test(location.protocol)
-  ? fetch('/api/health').then(r => r.ok ? r.json() : null).then(j => { serverMode = !!(j && j.ok && j.hasKey); }).catch(() => {})
-  : Promise.resolve());
-window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredInstall = e; });
-serverReady.then(() => { if(serverMode && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {}); });
 function speechParts(t){
   const clean = t.replace(/```[\s\S]*?```/g,' ').replace(/^\s*[-•]\s+/gm,'').replace(/[*`#|_>~]/g,'').replace(/([^.!?;:\s])[ \t]*\n+/g,'$1. ').replace(/\s+/g,' ').trim();
   const sentences = clean.match(/[^.!?;:]+[.!?;:]?\s*/g) || [];
@@ -760,14 +754,14 @@ function settings(){
     + '<div><label for="vc">Voz</label><select id="vc"><option value="">Voz padrão</option>'+vs.map(v=>'<option value="'+esc(v.name)+'"'+(v.name===st.voice?' selected':'')+'>'+esc(v.name)+'</option>').join('')+'</select></div>'
     + '<label class="sw"><span>Ler as respostas em voz alta</span><input type="checkbox" id="sp"'+(st.speak?' checked':'')+'></label>'
     + '<label class="sw"><span>Usar memória</span><input type="checkbox" id="mo"'+(st.memOn?' checked':'')+'></label>'
-    + (serverMode ? '' : '<div><label for="ky">Chave do Gemini (fica só neste telemóvel)</label><input type="password" id="ky" placeholder="AIza..." autocomplete="off" autocapitalize="off" spellcheck="false"></div>'
-    + '<div><label for="md">Modelo</label><input type="text" id="md" autocomplete="off" autocapitalize="off" spellcheck="false"></div>')
-    + (deferredInstall ? '<button class="btn" id="inst">📲 Instalar o Ali no telemóvel</button>' : '')
+    + '<p class="hint">A IA funciona pelo servidor: não precisas de nenhuma chave.</p>'
+    + '<div><label for="md">Modelo</label><input type="text" id="md" autocomplete="off" autocapitalize="off" spellcheck="false"></div>'
     + '<div id="mems"></div>'
     + '<div class="add"><input type="text" id="mi" placeholder="Algo que o Ali deve lembrar" maxlength="120"><button class="btn ghost" id="ma">Guardar</button></div>'
     + '<p class="hint">Só guardo o que escreveres aqui. Podes apagar quando quiseres.</p>'
     + '<p class="hint">Ali Assistente, versão '+APP_VERSION+'</p>'
     + '<button class="btn danger" id="clr">Apagar todo o histórico</button>'
+    + '<button class="btn ghost" id="out">Terminar sessão</button>'
     + '<button class="btn" id="done">Fechar</button>'
   );
   const drawMem = () => {
@@ -775,13 +769,8 @@ function settings(){
     st.mem.forEach((m,i)=>{ const d=document.createElement('div'); d.className='mem'; d.innerHTML='<span></span><button aria-label="Apagar memória">Apagar</button>'; d.querySelector('span').textContent=m; d.querySelector('button').onclick=()=>{ st.mem.splice(i,1); save(); drawMem(); }; $('#mems').appendChild(d); });
   };
   drawMem();
-  if($('#ky')){
-    $('#ky').value = st.gkey || '';
-    $('#ky').onchange = e => { st.gkey = e.target.value.trim(); save(); toast(st.gkey ? 'Chave guardada.' : 'Chave removida.'); };
-    $('#md').value = st.model || 'gemini-3.5-flash';
-    $('#md').onchange = e => { st.model = e.target.value.trim() || 'gemini-3.5-flash'; save(); };
-  }
-  if($('#inst')) $('#inst').onclick = async () => { deferredInstall.prompt(); await deferredInstall.userChoice; deferredInstall = null; closeSheet(); };
+  $('#md').value = st.model || 'gemini-3.5-flash';
+  $('#md').onchange = e => { st.model = e.target.value.trim() || 'gemini-3.5-flash'; save(); };
   $('#lg').onchange=e=>{ st.lang=e.target.value; st.voice=''; save(); settings(); };
   $('#dt').onchange=e=>{ st.detail=e.target.value; save(); };
   $('#vc').onchange=e=>{ st.voice=e.target.value; save(); };
@@ -789,7 +778,8 @@ function settings(){
   $('#mo').onchange=e=>{ st.memOn=e.target.checked; save(); };
   $('#ma').onclick=()=>{ const v=$('#mi').value.trim(); if(!v) return; st.mem.push(v); $('#mi').value=''; save(); drawMem(); };
   $('#clr').onclick=()=>confirmBox('Apagar todo o histórico?','Todas as conversas serão apagadas. A memória fica como está.','Apagar tudo',()=>{ S.chats=[]; S.current=null; renderMsgs(); renderList(); save(); });
-  $('#done').onclick=()=>{ const k=$('#ky'), m=$('#md'); if(k) st.gkey=k.value.trim(); if(m) st.model=m.value.trim()||'gemini-3.5-flash'; save(); closeSheet(); };
+  $('#out').onclick=logout;
+  $('#done').onclick=()=>{ const m=$('#md'); if(m) st.model=m.value.trim()||'gemini-3.5-flash'; save(); closeSheet(); };
 }
 
 /* ---------- ligações ---------- */
@@ -817,7 +807,71 @@ $('#setbtn').onclick = settings;
 $('#q').addEventListener('input', renderList);
 if('speechSynthesis' in window) speechSynthesis.onvoiceschanged = () => {};
 
-load().then(() => { renderTools(); renderMsgs(); renderList(); });
+
+/* ---------- contas (no servidor; a sessão é um cookie HttpOnly) ---------- */
+let CURUSER = null, authMode = 'login';
+function showAuth(){ $('#auth').style.display = 'flex'; }
+function toggleAuth(){
+  authMode = authMode === 'login' ? 'register' : 'login';
+  const reg = authMode === 'register';
+  $('#authSub').textContent = reg ? 'Cria a tua conta (só precisas uma vez)' : 'Entra na tua conta';
+  $('#aGo').textContent = reg ? 'Criar conta' : 'Entrar';
+  $('#aSwitch').textContent = reg ? 'Já tenho conta: entrar' : 'Não tenho conta: criar conta';
+  $('#aEmail').style.display = reg ? 'block' : 'none';
+  $('#aUser').placeholder = reg ? 'Nome de utilizador (letras, números ou _)' : 'Nome de utilizador ou email';
+  $('#aErr').textContent = '';
+}
+async function authGo(){
+  const btn = $('#aGo'); btn.disabled = true; $('#aErr').textContent = '';
+  try{
+    if(authMode === 'register'){
+      const r = await api('POST', '/api/auth/register', { username: $('#aUser').value, email: $('#aEmail').value, password: $('#aPass').value });
+      await enterApp(r.user.username);
+    } else {
+      const r = await api('POST', '/api/auth/login', { identifier: $('#aUser').value, password: $('#aPass').value });
+      await enterApp(r.user.username);
+    }
+  }catch(e){ $('#aErr').textContent = e.message || 'Não consegui entrar. Tenta outra vez.'; }
+  finally{ btn.disabled = false; }
+}
+/* Dados que ficaram só neste telemóvel (versão antiga): trazem-se uma vez, se a conta ainda não tiver dados no servidor. */
+async function importLocal(){
+  const raw = localStorage.getItem('ali-state:' + CURUSER);
+  if(!raw) return false;
+  try{
+    const d = migrate(JSON.parse(raw));
+    S.chats = d.chats || []; S.current = d.current || null;
+    S.settings = Object.assign(S.settings, d.settings || {});
+    delete S.settings.gkey; delete S.settings.key;
+    save(); toast('Trouxe para o servidor as conversas que estavam neste telemóvel. A chave antiga não foi copiada.', 9000);
+    return true;
+  }catch(e){ return false; }
+}
+async function enterApp(name){
+  const had = await load();
+  CURUSER = name;
+  if(!had && !localStorage.getItem('ali-migrated:' + name)){
+    if(await importLocal()) localStorage.setItem('ali-migrated:' + name, '1');
+  }
+  $('#auth').style.display = 'none';
+  renderTools(); renderMsgs(); renderList();
+}
+async function logout(){
+  if(saveT){ clearTimeout(saveT); await pushState(); }
+  try{ await api('POST', '/api/auth/logout', {}); }catch(e){}
+  location.reload();
+}
+$('#aGo').onclick = authGo;
+$('#aSwitch').onclick = toggleAuth;
+$('#aPass').addEventListener('keydown', e => { if(e.key === 'Enter') authGo(); });
+window.addEventListener('pagehide', () => { if(saveT){ clearTimeout(saveT); pushState(); } });
+
+/* arranque: se o cookie da sessão ainda é válido, entra direto; senão mostra o login */
+(async () => {
+  try{ const me = await api('GET', '/api/auth/me'); await enterApp(me.user.username); }
+  catch(e){ showAuth(); }
+})();
+
 </script>
 </body>
 </html>
